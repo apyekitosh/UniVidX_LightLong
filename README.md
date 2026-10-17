@@ -1,3 +1,161 @@
+# UniVidX: 24 GB, distilled and long-video fork
+
+This is a community fork of **[UniVidX](https://github.com/houyuanchen111/UniVidX)** by Houyuan Chen, Hong Li, Xianghao Kong, Tianrui Zhu, Yuwei Guo, Weiqing Xiao, Chongjie Ye, Lvmin Zhang, Hao Zhao and Anyi Rao ([paper](https://arxiv.org/pdf/2605.00658), [project page](https://houyuanchen111.github.io/UniVidX.github.io/), [weights](https://huggingface.co/houyuanchen/UniVidX)). The model, the method and the trained weights are entirely theirs; please cite their paper (see [Citation](#-citation) below) if you use this.
+
+This fork only adds **inference tooling** for **UniVid-Intrinsic** (RGB ↔ albedo / irradiance / normal), so you can run it on a single consumer GPU, much faster, and on videos longer than 21 frames. It was developed and tested on Windows 11 with an RTX A5000 (24 GB) and 128 GB of RAM.
+
+## What this fork adds
+
+- **Runs on 24 GB GPUs.** The 14B DiT and the text encoder stay in system RAM and their layers are streamed to the GPU as needed (`vram_limit`). The original code needs the full model in VRAM.
+- **Single-file checkpoints.** Load one-file DiTs, such as the ComfyUI repackaged models, instead of the six official shards. The Wan2.1 T2V 14B and Wan2.2 **low-noise** experts (T2V or I2V) can be used as the base model.
+- **Step-distill LoRAs** (lightx2v, Wan2.2 Lightning, FastWan): 4 steps with no CFG instead of 50 steps with CFG. That's about **2 minutes per clip instead of about 55**.
+- **SVI LoRA stacking.** A second LoRA merged on top of the distill LoRA. Stable Video Infinity improves consistency between long-video chunks.
+- **Long-video R2AIN (sliding window).** Decompose an RGB video of any length into albedo, irradiance and normals in overlapping 21-frame chunks that reuse the previous chunk's latents (details below).
+- **Optional SageAttention.** About 2× faster attention, about 1.34× faster overall, with no visible quality change.
+- **Gradio app** (`app.py`): every mode, long video, model and LoRA selection, and a resolution override, with outputs saved as separate videos, a 2×2 grid and a `settings.json`.
+- **Resolution override:** the trained 640×480, the input video's size, or any longest side, keeping the aspect ratio.
+- **`models.yaml`:** one file listing your model paths, so the same code runs on machines with different folder layouts.
+- **Compatibility fixes** for current PyTorch and Windows: video I/O through imageio (torchvision ≥ 0.22 dropped it) and UTF-8 config reading.
+
+The original CLI scripts and configs still work as upstream intended.
+
+## Results (RTX A5000, 640×480, 21-frame clip)
+
+| Setup | Time per clip |
+|---|---|
+| Original: 50 steps, CFG 5 | ~55 min |
+| Distill LoRA: 4 steps, CFG 1 | ~2 min 40 s |
+| Distill LoRA + SageAttention | ~2 min |
+
+Long video: about 2 minutes per chunk (12 new frames each). The first model load takes about 5 minutes, and the app keeps the model loaded between runs.
+
+Seam smoothness for long video, measured as the jump between chunks relative to the model's normal frame-to-frame flicker (lower is better, 1.0 = invisible):
+
+| Base model + LoRAs | Seam jump |
+|---|---|
+| Wan2.1 T2V + lightx2v T2V | 1.95× |
+| Wan2.1 T2V + Lightning I2V | 2.08× |
+| Wan2.2 I2V low-noise + Lightning I2V | 3.09× |
+| Wan2.2 T2V low-noise + Lightning I2V | 1.35× |
+| **Wan2.2 T2V low-noise + Lightning I2V + SVI v2 PRO** | **1.28×** (default) |
+
+## Setup
+
+Python 3.10 and a CUDA GPU. Example with [uv](https://docs.astral.sh/uv/) (plain `pip` in a venv works too):
+
+```bash
+git clone https://github.com/apyekitosh/UniVidX.git
+cd UniVidX
+uv venv .venv --python 3.10
+uv pip install --python .venv/Scripts/python.exe torch torchvision --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv/Scripts/python.exe -r requirement.txt
+```
+
+**Optional: SageAttention.** On Windows it isn't on PyPI. Install the wheel from [woct0rdho/SageAttention](https://github.com/woct0rdho/SageAttention/releases) that matches your torch and CUDA versions, plus `triton-windows`. For torch 2.11 + CUDA 12.8:
+
+```bash
+uv pip install --python .venv/Scripts/python.exe "triton-windows<3.8" "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0%2Bcu128torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl"
+```
+
+**System RAM:** loading briefly needs a lot of RAM, because the DiT is built in full precision before converting to bf16. This was tested with 128 GB; 64 GB is probably the practical minimum, but that's untested.
+
+### Models
+
+| File | Where to get it |
+|---|---|
+| Base DiT (recommended): `wan2.2_t2v_low_noise_14B_fp16.safetensors` | [Comfy-Org/Wan_2.2_ComfyUI_Repackaged](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/tree/main/split_files/diffusion_models) |
+| or Wan2.1: `wan2.1_t2v_14B_bf16.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models) |
+| UniVidX: `univid_intrinsic.safetensors` | [houyuanchen/UniVidX](https://huggingface.co/houyuanchen/UniVidX) |
+| Text encoder: `models_t5_umt5-xxl-enc-bf16.pth` + tokenizer folder `google/umt5-xxl` | [Wan-AI/Wan2.1-T2V-14B](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B) (ComfyUI's fp8 text encoder won't load) |
+| VAE: `wan_2.1_vae.safetensors` (or the official `Wan2.1_VAE.pth`) | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/vae) |
+| Distill LoRA: `Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors` | [Kijai/WanVideo_comfy](https://huggingface.co/Kijai/WanVideo_comfy/tree/main/LoRAs/Wan22-Lightning/old) (Wan2.2-Lightning by [lightx2v](https://huggingface.co/lightx2v/Wan2.2-Lightning)) |
+| SVI LoRA: `SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors` | [Kijai/WanVideo_comfy](https://huggingface.co/Kijai/WanVideo_comfy/tree/main/LoRAs/Stable-Video-Infinity/v2.0) (Stable Video Infinity by [vita-video-gen](https://huggingface.co/vita-video-gen/svi-model)) |
+
+The text encoder and tokenizer can be fetched in one go:
+
+```bash
+.venv/Scripts/hf.exe download Wan-AI/Wan2.1-T2V-14B models_t5_umt5-xxl-enc-bf16.pth google/umt5-xxl/special_tokens_map.json google/umt5-xxl/spiece.model google/umt5-xxl/tokenizer.json google/umt5-xxl/tokenizer_config.json --local-dir ./models/Wan-AI/Wan2.1-T2V-14B
+```
+
+Then copy `models.example.yaml` to `models.yaml` and point it at your files. `models.yaml` is git-ignored, so each machine keeps its own.
+
+```yaml
+diffusion_models:          # lists become dropdowns; the first entry is the default
+  - D:\models\wan2.2_t2v_low_noise_14B_fp16.safetensors
+unividx_models:
+  - D:\models\univid_intrinsic.safetensors
+distill_loras:
+  - D:\loras\Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors
+svi_loras:
+  - D:\loras\SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors
+text_encoder: D:\models\models_t5_umt5-xxl-enc-bf16.pth
+tokenizer: D:\models\google\umt5-xxl
+vae: D:\models\wan_2.1_vae.safetensors
+vram_limit: 16             # GB of VRAM for streamed weights; 16 suits a 24 GB card
+```
+
+## Using the app
+
+```bash
+.venv/Scripts/python.exe app.py
+```
+
+Open http://localhost:7860. The first generation loads the model, which takes a few minutes; later runs reuse it.
+
+**Model** (changing any of these reloads the model):
+- **Base DiT, UniVidX checkpoint, distill LoRA, SVI LoRA** come from `models.yaml`. LoRA strength 1.0 is the intended value.
+- **VRAM limit (GB):** budget for weights kept on the GPU; the rest is streamed from RAM. Lower it if you run out of memory, raise it for a little more speed. 0 loads everything onto the GPU, which needs more than 40 GB.
+- **SageAttention:** on when installed. It switches per run and never triggers a reload.
+
+**Single window:** one 21-frame clip (about 1.4 s at 15 fps) in any of the 15 modes. The mode name says inputs → outputs: `R2AIN` = RGB in, albedo + irradiance + normal out; `t2RAIN` = text only. The matching input video slots appear when you pick a mode.
+
+**Long video (R2AIN):** an RGB video of any length.
+- **Overlap (latent frames):** 2 gives smoother seams, 12 new frames per chunk; 1 is faster, 16 new frames per chunk.
+- **Free final steps:** final denoising steps in which the overlap is not held fixed, so the model can blend it with the new frames. 1 is a good default; 0 holds it fixed for every step and gives more visible seams.
+- **Max frames:** 0 processes the whole video.
+
+**Sampling (both tabs):**
+- **Steps / CFG:** 4 and 1.0 with a distill LoRA; about 50 and 5.0 without one.
+- **Prompt:** optional for video-in modes (leave it empty, which also disables CFG). Chinese prompts are recommended by the authors.
+- **Resolution:** 0 = trained 640×480; 1 = input video size; any other number = longest side in pixels, keeping the input's aspect ratio. Sizes are snapped to multiples of 16 and the input is stretched, never cropped. Larger sizes get much slower, and the app shows an estimate.
+
+## How the long-video mode works
+
+UniVidX denoises the four modalities as four latent videos side by side. Inputs (for example RGB in `R2AIN`) are held clean, and the outputs attend to them through cross-modal attention. For a long video:
+
+1. The video is split into 21-frame windows (6 latent frames: one single-frame latent + five four-frame latents).
+2. Each new window's RGB slot is the real footage for that window.
+3. For albedo, irradiance and normal, the head of each new window is the **previous window's last 1–2 generated latents, reused directly** (no decode/re-encode round trip, which would cause color drift), preceded by one re-encoded **anchor frame**, so the first latent is the single-frame latent the VAE expects.
+4. During sampling the head is re-noised to the current noise level after every step, so the model continues from it. The last step is optionally left free so seams can blend.
+5. When decoding, the anchor frame is dropped and the overlapping frames are crossfaded with the previous window.
+
+## Notes and limitations
+
+- **Only UniVid-Intrinsic is covered.** UniVid-Alpha works through the original CLI but not in the app, and the new options (distill, SVI, Sage) were only added to the intrinsic pipeline.
+- **Tested on Windows only.**
+- **Long video was evaluated on a short sample clip.** Very long or fast-moving footage may show more drift.
+- **Text-to-video (`t2RAIN`) runs, but long video is only for R2AIN.**
+- Using Wan2.2 bases and I2V LoRAs with UniVidX is an off-label combination. It worked well in testing, but the authors trained UniVidX on Wan2.1 T2V 14B.
+
+## Changes from upstream
+
+Per the Apache-2.0 license, these files were modified or added in this fork:
+
+- **Added:** `app.py`, `models.example.yaml`, `src/pipelines/long_video.py`, `src/video_io.py`
+- **Modified:**
+  - `src/pipelines/univid_intrinsic.py`: single-file DiT loading, I2V input-layer slicing, CPU offload, LoRA merging, configurable tokenizer path, long-video hooks, attention mode
+  - `src/pipelines/univid_alpha.py`: single-file DiT loading, CPU offload, LoRA merging, configurable tokenizer path
+  - `src/models/wan_video_dit_intrinsic.py`: SageAttention mode
+  - `src/lora/__init__.py`: Kohya/ComfyUI/peft-style Wan LoRA merging
+  - `scripts/inference_univid_*.py`, `scripts/train.py`, `src/trainers/unividx_trainer.py`: imageio video I/O and UTF-8 config reading
+  - `requirement.txt`, `.gitignore`
+
+Everything else is unchanged from upstream and remains under the original [Apache-2.0 license](LICENSE).
+
+---
+
+*The original UniVidX README follows.*
+
 ## ___***UniVidX: A Unified Multimodal Framework for Versatile Video Generation via Diffusion Priors***___
 
 <div align="center">

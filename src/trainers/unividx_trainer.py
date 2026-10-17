@@ -7,7 +7,7 @@ from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 import os
 from ..trainers.util import Callback
-from torchvision.io import write_video
+import imageio
 class ModelCheckpointCallback(Callback):     
     """
     checkpoint callback
@@ -159,12 +159,7 @@ class Trainer:
         print(f"Saving video to: {file_path}")
         if not os.path.exists(os.path.dirname(file_path)):
             os.makedirs(os.path.dirname(file_path),exist_ok = True)
-        write_video(
-            filename=file_path,
-            video_array=video_tensor,
-            fps=fps,
-            video_codec='h264' # Use common h264 codec
-        )
+        imageio.mimwrite(file_path, video_tensor.numpy(), fps=fps, codec='libx264')
         print("Video saved successfully!")
 
     def validate(self):

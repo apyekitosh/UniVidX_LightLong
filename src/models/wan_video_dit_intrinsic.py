@@ -20,12 +20,37 @@ def get_optimal_attention_mode():
 ATTENTION_MODE = get_optimal_attention_mode()
 print(f"Using attention mode: {ATTENTION_MODE}")
 
+
+def set_attention_mode(mode: str):
+    """Switch self-attention between "scaled_dot_product" and "sage" (SageAttention 2) at runtime."""
+    global ATTENTION_MODE
+    if mode == "sage":
+        import sageattention  # noqa: F401  (fail early if it is not installed)
+    ATTENTION_MODE = mode
+    print(f"Using attention mode: {ATTENTION_MODE}")
+
 try:
     FLASH_ATTN_3_AVAILABLE = False
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, drop_out:int = None):
+    if ATTENTION_MODE == "sage" and not compatibility_mode:
+        from sageattention import sageattn
+        if drop_out is not None and torch.rand(1) < drop_out:
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+            return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        # Cross-modal attention: every modality attends over all modalities' tokens. Folding the batch into one
+        # sequence is equivalent to the repeated K/V below and avoids the copies.
+        batch_size = q.shape[0]
+        q = rearrange(q, "b s (n d) -> 1 n (b s) d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> 1 n (b s) d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> 1 n (b s) d", n=num_heads)
+        x = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        return rearrange(x, "1 n (b s) d -> b s (n d)", n=num_heads, b=batch_size)
     if compatibility_mode or ATTENTION_MODE == "scaled_dot_product":
         if torch.rand(1) < drop_out:
             q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)

@@ -12,3 +12,4 @@ pandas
 accelerate
 peft
 datasets
+gradio

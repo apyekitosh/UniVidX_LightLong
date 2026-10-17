@@ -6,7 +6,8 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 import torchvision
-from torchvision.io import write_video
+import imageio
+import numpy as np
 import yaml
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,12 +29,8 @@ def _tensor2video(tensor: torch.Tensor, file_path: str, fps: int = 15):
     video_tensor = (video_tensor.clamp(0, 1) * 255).to(torch.uint8)
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     try:
-        write_video(
-            filename=file_path,
-            video_array=video_tensor,
-            fps=fps,
-            video_codec='h264',
-        )
+        # torchvision>=0.22 removed write_video; imageio-ffmpeg writes the same h264 mp4
+        imageio.mimwrite(file_path, video_tensor.numpy(), fps=fps, codec='libx264')
     except Exception as e:
         print(f"Failed to save video: {file_path}, error: {e}")
 
@@ -47,7 +44,7 @@ def _load_mp4_as_video_tensor(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    video, _, _ = torchvision.io.read_video(mp4_path, pts_unit="sec")
+    video = torch.from_numpy(np.stack(imageio.mimread(mp4_path, memtest=False)))
     if video.numel() == 0:
         raise ValueError(f"Empty video: {mp4_path}")
     if video.ndim != 4 or video.shape[-1] != 3:
@@ -86,7 +83,7 @@ def main():
     )
     args = parser.parse_args()
 
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     mode = config["mode"]
     inference_rgb_path = config.get("inference_rgb_path", None)

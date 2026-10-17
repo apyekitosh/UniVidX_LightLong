@@ -14,7 +14,7 @@ def main():
     parser.add_argument('--config', type=str, default="configs/wan2_1_fun_1_3b_control_material_lora_image_train_v0.yaml", help="Path to the main training config file.")
     args = parser.parse_args()
 
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     if 'environment_variables' in config and config['environment_variables']:
         print("--- Setting environment variables according to config ---")

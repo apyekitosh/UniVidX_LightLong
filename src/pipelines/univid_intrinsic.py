@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 from ..trainers.util import DiffusionTrainingModule
 from .util import BasePipeline, PipelineUnit, PipelineUnitRunner, ModelConfig, TeaCache, TemporalTiler_BCTHW
 from ..models import ModelManager, load_state_dict
-from ..models.wan_video_dit_intrinsic import WanModel, RMSNorm, sinusoidal_embedding_1d
+from ..models.wan_video_dit_intrinsic import WanModel, RMSNorm, sinusoidal_embedding_1d, set_attention_mode
 from ..models.wan_video_text_encoder import WanTextEncoder, T5RelativeEmbedding, T5LayerNorm
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample 
 from ..models.wan_video_image_encoder import WanImageEncoder
@@ -18,7 +18,7 @@ from ..models.wan_video_motion_controller import WanMotionControllerModel
 from ..schedulers.flow_match import FlowMatchScheduler
 from ..prompters import WanPrompter
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear, WanAutoCastLayerNorm
-from ..lora import GeneralLoRALoader
+from ..lora import GeneralLoRALoader, merge_wan_lora
 from PIL import Image
 
 class WanVideoPipeline(BasePipeline):
@@ -408,6 +408,12 @@ class WanVideoPipeline(BasePipeline):
         skip_download: bool = False,
         redirect_common_files: bool = True,
         use_usp=False,
+        dit_path: Optional[str] = None,
+        offload: bool = False,
+        distill_lora_path: Optional[str] = None,
+        distill_lora_strength: float = 1.0,
+        extra_lora_path: Optional[str] = None,
+        extra_lora_strength: float = 1.0,
     ):
         if redirect_common_files:
             redirect_dict = {
@@ -432,7 +438,7 @@ class WanVideoPipeline(BasePipeline):
             model_config.download_if_necessary(local_model_path, skip_download=skip_download, use_usp=use_usp)
             model_manager.load_model(
                 model_config.path,
-                device=model_config.offload_device or device,
+                device="cpu" if offload else (model_config.offload_device or device),
                 torch_dtype=model_config.offload_dtype or torch_dtype
             )
         
@@ -442,15 +448,29 @@ class WanVideoPipeline(BasePipeline):
         with open(config_path, "r") as f:
             dit_kwargs = json.load(f)
         pipe.dit = WanModel(**dit_kwargs)
-        pipe.dit.to(dtype=torch_dtype, device=device)
+        pipe.dit.to(dtype=torch_dtype, device="cpu" if offload else device)
+        # Either a single-file DiT checkpoint (e.g. ComfyUI repackaged bf16/fp16/fp8_e4m3fn) or the official 6 shards
+        if dit_path is not None:
+            dit_ckpt_paths = [dit_path]
+        else:
+            dit_ckpt_paths = [f"models/Wan-AI/Wan2.1-T2V-14B/diffusion_pytorch_model-0000{i}-of-00006.safetensors" for i in range(1,7)]
         state_dict = {}
-        for i in range(1,7):
-            ckpt_path = f"models/Wan-AI/Wan2.1-T2V-14B/diffusion_pytorch_model-0000{i}-of-00006.safetensors"
+        for ckpt_path in dit_ckpt_paths:
             state_dict.update(load_file(ckpt_path))
+        state_dict = {k.removeprefix("model.diffusion_model."): v for k, v in state_dict.items()}
+        # Wan I2V DiTs take [noisy latent (16) + mask (4) + image latent (16)] channels; keep only the noisy-latent part
+        in_dim = pipe.dit.patch_embedding.weight.shape[1]
+        if state_dict.get("patch_embedding.weight") is not None and state_dict["patch_embedding.weight"].shape[1] > in_dim:
+            print(f"Slicing patch_embedding from {state_dict['patch_embedding.weight'].shape[1]} to {in_dim} input channels (I2V DiT)")
+            state_dict["patch_embedding.weight"] = state_dict["patch_embedding.weight"][:, :in_dim]
+        if any(k.endswith("scale_weight") for k in state_dict):
+            raise ValueError(f"{dit_path} is a scaled fp8 checkpoint, which is not supported. Use a bf16, fp16 or plain fp8_e4m3fn file instead.")
         incompatible = pipe.dit.load_state_dict(state_dict, strict=False)
+        state_dict_keys = list(state_dict.keys())
+        del state_dict
         missing_keys = list(getattr(incompatible, "missing_keys", []))
         unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
-        loaded_keys = [k for k in state_dict.keys() if k not in unexpected_keys]
+        loaded_keys = [k for k in state_dict_keys if k not in unexpected_keys]
         print(f"Loaded keys ({len(loaded_keys)}):")
         for k in loaded_keys:
             print(f"- {k}")
@@ -460,6 +480,11 @@ class WanVideoPipeline(BasePipeline):
         print(f"Unexpected keys ({len(unexpected_keys)}):")
         for k in unexpected_keys:
             print(f"- {k}")
+        # Merge a step-distill LoRA into the base weights before the UniVidX adapters are injected
+        if distill_lora_path is not None:
+            merge_wan_lora(pipe.dit, distill_lora_path, distill_lora_strength)
+        if extra_lora_path is not None:
+            merge_wan_lora(pipe.dit, extra_lora_path, extra_lora_strength)
         pipe.vae = model_manager.fetch_model("wan_video_vae") # type: ignore
         pipe.image_encoder = model_manager.fetch_model("wan_video_image_encoder") # type: ignore
         pipe.motion_controller = model_manager.fetch_model("wan_video_motion_controller") # type: ignore
@@ -497,6 +522,12 @@ class WanVideoPipeline(BasePipeline):
         scheduler_copy = copy.deepcopy(self.scheduler)
         scheduler_copy.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         training_mode = inputs_shared.get("training_mode")
+        # Long-video chunking: latents to hold fixed at the head of the given slots, re-noised every step
+        fixed_head_latents = inputs_shared.pop("fixed_head_latents", None)
+        fixed_head_slots = inputs_shared.pop("fixed_head_slots", None)
+        # Final steps where the head is left free, so the model can harmonize it with the new frames
+        head_release_steps = inputs_shared.pop("head_release_steps", 0)
+        return_latents = inputs_shared.pop("return_latents", False)
         # Inputs
         inputs_posi = {
             "prompt": prompt,
@@ -559,6 +590,13 @@ class WanVideoPipeline(BasePipeline):
             inputs_shared["latents"][0], sigmas = self.scheduler.add_noise(inputs_shared["inference_rgb_latents"], noise_0, self.scheduler.timesteps[torch.tensor([999])].to(dtype=self.torch_dtype, device=self.device))
             inputs_shared["latents"][1], sigmas = self.scheduler.add_noise(inputs_shared["inference_albedo_latents"], noise_0, self.scheduler.timesteps[torch.tensor([999])].to(dtype=self.torch_dtype, device=self.device))
             inputs_shared["latents"][2], sigmas = self.scheduler.add_noise(inputs_shared["inference_irradiance_latents"], noise_0, self.scheduler.timesteps[torch.tensor([999])].to(dtype=self.torch_dtype, device=self.device))
+
+        if fixed_head_latents is not None:
+            num_head = fixed_head_latents.shape[2]
+            fixed_head_latents = fixed_head_latents.to(dtype=self.torch_dtype, device=self.device)
+            head_noise = inputs_shared["latents"][fixed_head_slots, :, :num_head].clone()
+            sigma = float(scheduler_copy.sigmas[0])
+            inputs_shared["latents"][fixed_head_slots, :, :num_head] = (1 - sigma) * fixed_head_latents + sigma * head_noise
 
         for progress_id, timestep in enumerate(tqdm(scheduler_copy.timesteps)):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
@@ -709,6 +747,10 @@ class WanVideoPipeline(BasePipeline):
             elif training_mode == "RAI2N":
                 inputs_shared["latents"][[3]] = scheduler_copy.step(noise_pred, scheduler_copy.timesteps[progress_id], inputs_shared["latents"])[[3]] 
 
+            if fixed_head_latents is not None and progress_id < len(scheduler_copy.timesteps) - head_release_steps:
+                sigma = float(scheduler_copy.sigmas[progress_id + 1]) if progress_id + 1 < len(scheduler_copy.sigmas) else 0.0
+                inputs_shared["latents"][fixed_head_slots, :, :num_head] = (1 - sigma) * fixed_head_latents + sigma * head_noise
+
        
         
         # VACE (TODO: remove it)
@@ -718,6 +760,8 @@ class WanVideoPipeline(BasePipeline):
         # Decode
         self.load_models_to_device(['vae'])
         video_dict = {}
+        if return_latents:
+            video_dict["latents"] = inputs_shared["latents"].clone()
         if training_mode == "t2RAIN":
             video_rgb = self.vae.decode(inputs_shared["latents"][[0]], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
             video_rgb = self.vae_output_to_video(video_rgb, pattern="B C T H W")
@@ -1352,8 +1396,18 @@ class UniVidIntrinsic(DiffusionTrainingModule):
         material_resume_from_checkpoint: Optional[str] = None,
         normal_resume_from_checkpoint: Optional[str] = None,
         lora_ckpt_path: Optional[str] = None,
+        dit_path: Optional[str] = None,
+        tokenizer_path: str = "models/Wan-AI/Wan2.1-T2V-14B/google/umt5-xxl",
+        vram_limit: Optional[float] = None,
+        distill_lora_path: Optional[str] = None,
+        distill_lora_strength: float = 1.0,
+        extra_lora_path: Optional[str] = None,
+        extra_lora_strength: float = 1.0,
+        attention_mode: Optional[str] = None,
     ):
         super().__init__()
+        if attention_mode is not None:
+            set_attention_mode(attention_mode)
         # Load models
         model_configs = []
         if model_paths is not None:
@@ -1362,12 +1416,12 @@ class UniVidIntrinsic(DiffusionTrainingModule):
         if model_id_with_origin_paths is not None:
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
-        tokenizer_config = ModelConfig(path="models/Wan-AI/Wan2.1-T2V-14B/google/umt5-xxl")
+        tokenizer_config = ModelConfig(path=tokenizer_path)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         print(f"Using device: {device}")
         self.torch_dtype = torch.bfloat16
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, tokenizer_config=tokenizer_config, model_configs=model_configs,redirect_common_files=False) # Load pretrained weights
+        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, tokenizer_config=tokenizer_config, model_configs=model_configs,redirect_common_files=False,dit_path=dit_path,offload=vram_limit is not None,distill_lora_path=distill_lora_path,distill_lora_strength=distill_lora_strength,extra_lora_path=extra_lora_path,extra_lora_strength=extra_lora_strength) # Load pretrained weights
 
         if lora_modalities is not None:
             lora_configs = []
@@ -1416,6 +1470,11 @@ class UniVidIntrinsic(DiffusionTrainingModule):
                 print(f"⚠️ missing keys: {len(missing_keys)} ")
                 for key in list(missing_keys)[:5]:
                     print(f"  - {key}")
+
+        # Stream weights from RAM so the 14B DiT fits on smaller GPUs; vram_limit is the GPU budget in GB
+        if vram_limit is not None:
+            self.pipe.enable_vram_management(vram_limit=vram_limit)
+            print(f"VRAM management enabled (limit: {vram_limit} GB)")
 
         self.pipe.units = [ 
             WanVideoUnit_ShapeChecker(),

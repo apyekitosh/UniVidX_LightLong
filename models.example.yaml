@@ -1,0 +1,29 @@
+# Copy this file to models.yaml and set the paths for this machine.
+# Lists show up as dropdowns in the app; the first entry is the default.
+# Plain Windows paths work as-is (no quotes needed). A list with one file can also be a single path.
+
+# Base DiT: Wan2.2 T2V low-noise (recommended) or Wan2.1 T2V 14B, single-file safetensors
+diffusion_models:
+  - C:\models\diffusion_models\wan2.2_t2v_low_noise_14B_fp16.safetensors
+  - C:\models\diffusion_models\wan2.1_t2v_14B_bf16.safetensors
+
+# UniVidX checkpoints from https://huggingface.co/houyuanchen/UniVidX
+unividx_models:
+  - C:\models\unividx\univid_intrinsic.safetensors
+
+# Step-distill LoRAs (use 4 steps, CFG 1). Wan2.2 I2V low-noise ones give the most consistent long videos.
+distill_loras:
+  - C:\models\loras\Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors
+
+# Merged on top of the distill LoRA; improves seams in long videos
+svi_loras:
+  - C:\models\loras\SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors
+
+# From https://huggingface.co/Wan-AI/Wan2.1-T2V-14B (the official .pth, not ComfyUI's fp8 text encoder)
+text_encoder: C:\models\text_encoders\models_t5_umt5-xxl-enc-bf16.pth
+tokenizer: C:\models\text_encoders\google\umt5-xxl
+# Wan2.1 VAE: the official Wan2.1_VAE.pth or ComfyUI's wan_2.1_vae.safetensors
+vae: C:\models\vae\wan_2.1_vae.safetensors
+
+# GPU budget in GB for streaming weights from RAM (16 fits a 24 GB card)
+vram_limit: 16
